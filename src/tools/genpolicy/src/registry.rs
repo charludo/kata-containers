@@ -23,10 +23,7 @@ use oci_distribution::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{digest::typenum::Unsigned, digest::OutputSizeUser, Sha256};
-use std::{
-    collections::BTreeMap, fs::OpenOptions, io, io::BufWriter, io::Read, io::Seek, io::Write,
-    path::Path,
-};
+use std::{collections::BTreeMap, fs::OpenOptions, io, io::Read, io::Seek, io::Write, path::Path};
 use tokio::io::AsyncWriteExt;
 
 /// Container image properties obtained from an OCI repository.
@@ -452,19 +449,26 @@ pub fn add_verity_and_users_to_store(
     verity_hash: &str,
     passwd: &str,
 ) -> Result<()> {
-    // open the json file in read mode, create it if it doesn't exist
-    let read_file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(cache_file)?;
+    // Open the json file in read-only mode
+    let read_file = match OpenOptions::new().read(true).open(cache_file) {
+        Ok(file) => file,
+        // If the file did not exist, try creating it.
+        // This is necessary on the first invocation of this function.
+        // create_new() fails if the file was created elsewhere in the meantime
+        Err(e) if e.kind() == io::ErrorKind::NotFound => OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(cache_file)?,
+        Err(e) => return Err(anyhow!(e)),
+    };
+    FileExt::lock_exclusive(&read_file)?;
 
-    let mut data: Vec<ImageLayer> = if let Ok(vec) = serde_json::from_reader(read_file) {
-        vec
-    } else {
-        // Delete the malformed file here if it's present
-        Vec::new()
+    // Return empty vector if the file is malformed
+    let mut data: Vec<ImageLayer> = match serde_json::from_reader(&read_file) {
+        Ok(data) => data,
+        Err(e) if e.is_eof() => Vec::new(), // empty file
+        Err(e) => return Err(e.into()),
     };
 
     // Add new data to the deserialized JSON
@@ -474,23 +478,16 @@ pub fn add_verity_and_users_to_store(
         passwd: passwd.to_string(),
     });
 
-    // Serialize in pretty format
-    let serialized = serde_json::to_string_pretty(&data)?;
+    // Write the serialized data to a temporary file
+    let temp_file = tempfile::NamedTempFile::new()?;
+    serde_json::to_writer_pretty(&temp_file, &data)?;
 
-    // Open the JSON file to write
-    let file = OpenOptions::new().write(true).open(cache_file)?;
+    // Atomically replace the original cache file
+    temp_file.persist(cache_file)?;
 
-    // try to lock the file, if it fails, get the error
-    let result = file.try_lock_exclusive();
-    if result.is_err() {
-        warn!("Waiting to lock file: {cache_file}");
-        file.lock_exclusive()?;
-    }
-    // Write the serialized JSON to the file
-    let mut writer = BufWriter::new(&file);
-    writeln!(writer, "{}", serialized)?;
-    writer.flush()?;
-    file.unlock()?;
+    // Unlock only after having replaced the file
+    FileExt::unlock(&read_file)?;
+
     Ok(())
 }
 
